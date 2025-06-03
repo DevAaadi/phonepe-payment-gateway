@@ -27,12 +27,13 @@ export const createRechargeOrder = asyncHandler(async (req, res) => {
   console.log('=== Starting Recharge Order Creation ===');
   console.log('Request body:', req.body);
 
-  // Log environment variables for debugging (remove in production)
-  console.log('Env Vars:', {
-    MERCHANT_ID,
+  // Debug logging for environment variables
+  console.log('Environment Variables:', {
+    MERCHANT_ID: MERCHANT_ID,
     SALT_KEY_EXISTS: !!SALT_KEY,
-    SALT_INDEX,
-    PHONEPE_BASE_URL,
+    SALT_INDEX: SALT_INDEX,
+    PHONEPE_ENV: PHONEPE_ENV,
+    PHONEPE_BASE_URL: PHONEPE_BASE_URL
   });
 
   const { amount } = req.body;
@@ -50,7 +51,10 @@ export const createRechargeOrder = asyncHandler(async (req, res) => {
     return res.status(400).json({ success: false, message: 'Invalid request parameters' });
   }
 
-  const merchantTransactionId = `MT_${Date.now()}_${user._id}`;
+  // Generate a shorter merchantTransactionId
+  const timestamp = Date.now().toString().slice(-8); // Last 8 digits of timestamp
+  const userId = user._id.toString().slice(-6); // Last 6 digits of user ID
+  const merchantTransactionId = `MT${timestamp}${userId}`;
   console.log('Generated merchantTransactionId:', merchantTransactionId);
 
   const payload = {
@@ -59,7 +63,7 @@ export const createRechargeOrder = asyncHandler(async (req, res) => {
     merchantUserId: user._id.toString(),
     amount: Math.round(amount * 100), // amount in paise
     redirectUrl: `${FRONTEND_URL}/dashboard/payment-callback`,
-    redirectMode: "POST",
+    // redirectMode: "GET",
     callbackUrl: `${BACKEND_URL}/api/recharge/verify`,
     mobileNumber: user.phone,
     paymentInstrument: { type: "PAY_PAGE" }
@@ -81,7 +85,7 @@ export const createRechargeOrder = asyncHandler(async (req, res) => {
     user: user._id,
     amount,
     phonepeMerchantTransactionId: merchantTransactionId,
-    status: 'pending'
+    status: 'not-processed'
   });
   console.log('Recharge record created:', recharge._id);
 
@@ -115,6 +119,8 @@ export const createRechargeOrder = asyncHandler(async (req, res) => {
     }
 
     console.log('Payment initiation successful');
+    console.log('Full PhonePe Response:', JSON.stringify(response.data, null, 2));
+    
     return res.status(201).json({
       success: true,
       data: response.data,
@@ -142,57 +148,81 @@ export const verifyRecharge = asyncHandler(async (req, res) => {
   console.log('=== Starting Recharge Verification ===');
   console.log('Verification request body:', req.body);
 
-  const { merchantTransactionId, code, transactionId } = req.body;
-  const recharge = await Recharge.findOne({ phonepeMerchantTransactionId: merchantTransactionId });
+  const { rechargeId, phonepeMerchantTransactionId } = req.body;
+  
+  if (!rechargeId || !phonepeMerchantTransactionId) {
+    console.log('Missing required fields:', { rechargeId, phonepeMerchantTransactionId });
+    return res.status(400).json({ 
+      success: false, 
+      message: 'rechargeId and phonepeMerchantTransactionId are required' 
+    });
+  }
+
+  const recharge = await Recharge.findOne({ 
+    _id: rechargeId,
+    phonepeMerchantTransactionId: phonepeMerchantTransactionId 
+  });
+  
   console.log('Found recharge record:', recharge?._id);
 
   if (!recharge) {
-    console.log('Recharge record not found for merchantTransactionId:', merchantTransactionId);
+    console.log('Recharge record not found');
     return res.status(404).json({ success: false, message: 'Recharge not found' });
   }
 
-  console.log('Updating recharge record...');
-  recharge.phonepeTransactionId = transactionId;
-  recharge.phonepeResponseCode = code;
-  recharge.status = code === 'PAYMENT_SUCCESS' ? 'completed' : 'failed';
-  await recharge.save();
-  console.log('Recharge status updated:', recharge.status);
+  // Check payment status with PhonePe
+  try {
+    const stringToSign = `/pg/v1/status/${MERCHANT_ID}/${phonepeMerchantTransactionId}` + SALT_KEY;
+    const checksumHash = crypto.createHash('sha256').update(stringToSign).digest('hex');
+    const checksum = checksumHash + '###' + SALT_INDEX;
 
-  if (recharge.status === 'completed') {
-    console.log('Payment successful, updating user wallet...');
-    const user = await User.findById(recharge.user);
-    if (user) {
-      user.walletBalance += recharge.amount;
-      await user.save();
-      console.log('User wallet updated. New balance:', user.walletBalance);
+    const response = await axios.get(
+      `${PHONEPE_BASE_URL}/pg/v1/status/${MERCHANT_ID}/${phonepeMerchantTransactionId}`,
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-VERIFY': checksum,
+          'X-MERCHANT-ID': MERCHANT_ID
+        }
+      }
+    );
+
+    console.log('PhonePe status response:', response.data);
+
+    if (response.data.success) {
+      const paymentSuccess = response.data.data.state === 'COMPLETED';
+      
+      recharge.status = paymentSuccess ? 'completed' : 'failed';
+      recharge.phonepeTransactionId = response.data.data.merchantTransactionId;
+      recharge.phonepeResponseCode = response.data.data.responseCode;
+      await recharge.save();
+
+      if (paymentSuccess) {
+        console.log('Payment successful, updating user wallet...');
+        const user = await User.findById(recharge.user);
+        if (user) {
+          user.walletBalance += recharge.amount;
+          await user.save();
+          console.log('User wallet updated. New balance:', user.walletBalance);
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: paymentSuccess ? 'Success' : 'Failed',
+        recharge
+      });
     } else {
-      console.warn('User not found for recharge update');
+      return res.status(400).json({
+        success: false,
+        message: 'Failed to verify payment status'
+      });
     }
+  } catch (error) {
+    console.error('Error verifying payment:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error verifying payment status'
+    });
   }
-
-  return res.status(200).json({
-    success: true,
-    message: recharge.status === 'completed' ? 'Success' : 'Failed',
-    recharge
-  });
-});
-
-export const getRechargeHistory = asyncHandler(async (req, res) => {
-  console.log('=== Getting Recharge History ===');
-  console.log('User ID:', req.user._id);
-
-  const recharges = await Recharge.find({ user: req.user._id }).sort({ createdAt: -1 });
-  console.log('Found recharge records:', recharges.length);
-
-  return res.status(200).json({ success: true, recharges });
-});
-
-export const getWalletBalance = asyncHandler(async (req, res) => {
-  console.log('=== Getting Wallet Balance ===');
-  console.log('User ID:', req.user._id);
-
-  const user = await User.findById(req.user._id);
-  console.log('User wallet balance:', user?.walletBalance ?? 0);
-
-  return res.status(200).json({ success: true, balance: user?.walletBalance ?? 0 });
 });
